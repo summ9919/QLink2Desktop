@@ -508,6 +508,11 @@ func TestDecideRoute(t *testing.T) {
 		{"有端口时目标地址不影响判定", PackageSpec{Port: 8080, ShortcutURL: "https://a.b/c"}, routeDirect},
 		{"无端口即 CGI 跳转", PackageSpec{}, routeRedirect},
 		{"无端口但有网址仍是 CGI 跳转", PackageSpec{ShortcutURL: "https://a.b/c"}, routeRedirect},
+		{"公网反代即使有端口也必须走 CGI",
+			PackageSpec{Port: 8080, WANMode: domain.WANModePublic, PublicURL: "https://ha.example.com"},
+			routeRedirect},
+		{"公网模式缺地址时退回直连",
+			PackageSpec{Port: 8080, WANMode: domain.WANModePublic}, routeDirect},
 	}
 	for _, tc := range cases {
 		tc := tc
@@ -585,6 +590,42 @@ func TestBuildSpecShortcutGoesThroughCGI(t *testing.T) {
 	}
 	if !needsCGI(spec) {
 		t.Error("快捷方式必须生成 CGI —— 它没有别的办法跳出飞牛主机")
+	}
+}
+
+func TestBuildSpecPublicWANUsesCGI(t *testing.T) {
+	t.Parallel()
+
+	svc, _, _ := newTestService(t)
+
+	local := testLink("item-wan", "HA", 8123)
+	local.WANMode = domain.WANModePublic
+	local.PublicURL = "https://ha.example.com/"
+	local.Normalize()
+
+	spec := svc.buildSpec(local, 0)
+	if spec.Port != 0 {
+		t.Errorf("公网反代模式不应在入口声明端口（否则外网仍走中继），实际 %d", spec.Port)
+	}
+	if spec.LocalPort != 8123 {
+		t.Errorf("内网仍需回到本机端口 8123，实际 %d", spec.LocalPort)
+	}
+	if spec.PublicURL != "https://ha.example.com" {
+		t.Errorf("反代地址未传入包配置，实际 %q", spec.PublicURL)
+	}
+	if got := decideRoute(spec); got != routeRedirect {
+		t.Errorf("公网反代模式必须走 CGI 分流，实际 %v", got)
+	}
+
+	// 端口映射形态：内网应回到代理端口，而不是远端真实端口。
+	proxy := domain.Link{ID: "item-wan-proxy", Name: "Remote", Kind: domain.KindProxy,
+		Scheme: domain.SchemeHTTP, Host: "10.0.0.9", Port: 8080, Path: "/",
+		UI: domain.UIWindow, WANMode: domain.WANModePublic, PublicURL: "https://r.example.com"}
+	proxy.Normalize()
+	pspec := svc.buildSpec(proxy, 18002)
+	if pspec.Port != 0 || pspec.LocalPort != 18002 {
+		t.Errorf("端口映射的内网回退端口应为代理端口 18002，实际 port=%d local=%d",
+			pspec.Port, pspec.LocalPort)
 	}
 }
 

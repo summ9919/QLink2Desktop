@@ -31,6 +31,31 @@ type Icon struct {
 // IsAuto 报告该图标是否交回系统自动匹配。
 func (i Icon) IsAuto() bool { return i.Source == IconAuto || strings.TrimSpace(i.Ref) == "" }
 
+// WANMode 描述外网访问时优先走哪条链路。
+//
+// 飞牛桌面入口本身只支持「本机端口」一种形态：内网直连，外网经 FN Connect
+// 中继。中继要绕一圈，速度通常比不上用户自建的公网反代（域名 + HTTPS）。
+// 因此每条链接可以单独声明：外网优先跳到自己的反代地址，内网仍然直连本机。
+type WANMode string
+
+const (
+	// WANModeRelay 走飞牛 Connect 中继（默认，保持既有行为）。
+	WANModeRelay WANMode = "relay"
+	// WANModeFnosProxy 走 fnOS 内置反代（入口不声明 port，让 fnOS Nginx / 子域名反代接手）。
+	WANModeFnosProxy WANMode = "fn_proxy"
+	// WANModePublic 外网优先使用用户填写的公网反代地址。
+	WANModePublic WANMode = "public"
+)
+
+// Normalize 把空值与未知值收敛为默认的中继模式。
+func (m WANMode) Normalize() WANMode {
+	switch m {
+	case WANModeFnosProxy, WANModePublic:
+		return m
+	}
+	return WANModeRelay
+}
+
 // Container 记录链接背后的 Docker 容器信息（可选）。
 type Container struct {
 	Name    string `json:"name,omitempty"`
@@ -56,6 +81,11 @@ type Link struct {
 	Host   string `json:"host,omitempty"`   // 127.0.0.1 / 192.168.1.10 / example.com
 	Port   int    `json:"port,omitempty"`
 	Path   string `json:"path,omitempty"` // 访问路径，或 KindShortcut 的完整 URL
+
+	// 外网访问优先链路。默认 relay（飞牛 Connect 中继）；
+	// 选 public 时，外网打开桌面图标会先跳到 PublicURL，内网仍直连本机端口。
+	WANMode   WANMode `json:"wan_mode,omitempty"`
+	PublicURL string  `json:"public_url,omitempty"` // 公网反代地址，如 https://ha.example.com
 
 	Container Container `json:"container,omitempty"`
 
@@ -93,6 +123,9 @@ func (l *Link) Normalize() {
 		l.Scheme = SchemeHTTP
 	}
 	l.Scheme = strings.ToLower(l.Scheme)
+
+	l.PublicURL = strings.TrimRight(strings.TrimSpace(l.PublicURL), "/")
+	l.WANMode = l.WANMode.Normalize()
 
 	if l.Kind == KindLocalPort {
 		// 本机端口只可能指向本机回环地址，前端也不允许改。
@@ -138,6 +171,19 @@ func (l Link) Validate() error {
 		}
 	}
 
+	if l.WANMode == WANModePublic {
+		if l.PublicURL == "" {
+			return fmt.Errorf("%w: 选择公网反代时必须填写反代地址", ErrValidation)
+		}
+		u, err := url.Parse(l.PublicURL)
+		if err != nil || u.Host == "" || (u.Scheme != SchemeHTTP && u.Scheme != SchemeHTTPS) {
+			return fmt.Errorf("%w: 反代地址必须是 http(s):// 开头的完整地址", ErrValidation)
+		}
+		if u.RawQuery != "" || u.Fragment != "" {
+			return fmt.Errorf("%w: 反代地址只填到域名或路径前缀，不要带 ? 或 #", ErrValidation)
+		}
+	}
+
 	if l.Icon.Source == IconText && strings.TrimSpace(l.Icon.Text) == "" {
 		return fmt.Errorf("%w: 文字图标必须填写文字内容", ErrValidation)
 	}
@@ -159,6 +205,12 @@ func (l Link) ShortcutURL() string {
 		return raw
 	}
 	return SchemeHTTPS + "://" + raw
+}
+
+// WantsPublicWAN 报告外网访问是否应当优先走用户配置的公网反代地址。
+// 快捷方式本身就是完整网址，不需要再分流。
+func (l Link) WantsPublicWAN() bool {
+	return l.Kind != KindShortcut && l.WANMode == WANModePublic && strings.TrimSpace(l.PublicURL) != ""
 }
 
 // BackendURL 返回反向代理应当转发到的后端地址。

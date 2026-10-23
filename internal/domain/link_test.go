@@ -43,6 +43,28 @@ func TestLinkValidate(t *testing.T) {
 			link: valid(Link{Name: "A", Kind: KindShortcut, Path: "https://example.com/x"}),
 		},
 		{
+			name: "公网反代合法",
+			link: valid(Link{Name: "A", Kind: KindLocalPort, Port: 8080,
+				WANMode: WANModePublic, PublicURL: "https://ha.example.com"}),
+		},
+		{
+			name:    "公网反代缺地址",
+			link:    valid(Link{Name: "A", Kind: KindLocalPort, Port: 8080, WANMode: WANModePublic}),
+			wantErr: true,
+		},
+		{
+			name: "公网反代协议非法",
+			link: valid(Link{Name: "A", Kind: KindLocalPort, Port: 8080,
+				WANMode: WANModePublic, PublicURL: "ha.example.com"}),
+			wantErr: true,
+		},
+		{
+			name: "公网反代带查询参数",
+			link: valid(Link{Name: "A", Kind: KindLocalPort, Port: 8080,
+				WANMode: WANModePublic, PublicURL: "https://ha.example.com/?token=x"}),
+			wantErr: true,
+		},
+		{
 			name:    "快捷方式空网址",
 			link:    valid(Link{Name: "A", Kind: KindShortcut}),
 			wantErr: true,
@@ -110,6 +132,34 @@ func TestLinkNormalizeDefaults(t *testing.T) {
 	}
 	if l.Path != "/admin" {
 		t.Errorf("路径应补前导斜杠，实际 %q", l.Path)
+	}
+}
+
+func TestLinkNormalizeWANMode(t *testing.T) {
+	t.Parallel()
+
+	l := Link{Name: "A", Kind: KindLocalPort, Port: 8080, PublicURL: "  https://ha.example.com/  "}
+	l.Normalize()
+	if l.WANMode != WANModeRelay {
+		t.Errorf("未指定外网方式时应默认走中继，实际 %q", l.WANMode)
+	}
+	if l.PublicURL != "https://ha.example.com" {
+		t.Errorf("反代地址应 trim 并去掉末尾斜杠，实际 %q", l.PublicURL)
+	}
+	if l.WantsPublicWAN() {
+		t.Error("默认中继模式不应启用公网反代分流")
+	}
+
+	l.WANMode = WANModePublic
+	if !l.WantsPublicWAN() {
+		t.Error("公网反代模式且填了地址时应启用分流")
+	}
+
+	shortcut := Link{Name: "S", Kind: KindShortcut, Path: "https://a.b",
+		WANMode: WANModePublic, PublicURL: "https://ha.example.com"}
+	shortcut.Normalize()
+	if shortcut.WantsPublicWAN() {
+		t.Error("快捷方式本身就是完整网址，不应再启用公网反代分流")
 	}
 }
 

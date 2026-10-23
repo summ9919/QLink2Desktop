@@ -36,6 +36,9 @@ type linkRequest struct {
 	Port   int    `json:"port,omitempty"`
 	Path   string `json:"path,omitempty"`
 
+	WANMode   string `json:"wan_mode,omitempty"`
+	PublicURL string `json:"public_url,omitempty"`
+
 	UI        string            `json:"ui,omitempty"`
 	AllUsers  bool              `json:"all_users,omitempty"`
 	NoDisplay bool              `json:"no_display,omitempty"`
@@ -68,6 +71,8 @@ func (req linkRequest) toDomain(base domain.Link) (domain.Link, error) {
 	l.Host = req.Host
 	l.Port = req.Port
 	l.Path = req.Path
+	l.WANMode = domain.WANMode(req.WANMode)
+	l.PublicURL = req.PublicURL
 
 	l.UI = domain.UIType(req.UI)
 	l.AllUsers = req.AllUsers
@@ -86,6 +91,8 @@ func (req linkRequest) toDomain(base domain.Link) (domain.Link, error) {
 		l.Container = domain.Container{}
 		l.Port = 0
 		l.Host = ""
+		l.WANMode = domain.WANModeRelay
+		l.PublicURL = ""
 	}
 
 	if req.Enabled != nil {

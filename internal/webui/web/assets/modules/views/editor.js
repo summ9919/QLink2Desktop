@@ -36,6 +36,8 @@ export function openLinkEditor(existing = null, preset = {}) {
     host: existing?.host || preset.host || '',
     port: existing?.port || preset.port || 0,
     path: existing?.path || preset.path || '/',
+    wan_mode: existing?.wan_mode || 'relay',
+    public_url: existing?.public_url || '',
     ui: existing?.ui || 'iframe',
     all_users: existing?.all_users ?? true,
     no_display: existing?.no_display ?? false,
@@ -193,6 +195,54 @@ export function openLinkEditor(existing = null, preset = {}) {
           ]));
         }
 
+        /* 外网访问：三段式 —— 飞牛 Connect / fnOS 反代 / 自定义公网反代。 */
+        const wanHint = h('span', { class: 'hint' });
+        const publicInput = h('input', {
+          type: 'text', value: model.public_url,
+          placeholder: 'https://ha.example.com',
+          oninput: (e) => { model.public_url = e.target.value; },
+        });
+        const syncWan = () => {
+          switch (model.wan_mode) {
+            case 'fn_proxy':
+              wanHint.textContent =
+                '入口不声明单独端口，让 fnOS Nginx / 应用设置里填的反代域名接手。' +
+                '浏览器访问的是「域名 + 子路径」，不再是公网 IP + 端口。';
+              break;
+            case 'public':
+              wanHint.textContent =
+                '外网打开图标时直接跳到这里（绕过飞牛中继）；内网继续走 fnOS 反代路径。';
+              break;
+            default:
+              wanHint.textContent =
+                '保留既有形态：入口声明 protocol + port + url，由飞牛 Connect 中继或 fnOS 子域名反代处理。';
+          }
+        };
+        const wanSeg = segmented([
+          { value: 'relay', label: '飞牛 ID' },
+          { value: 'fn_proxy', label: 'fnOS 反代' },
+          { value: 'public', label: '自定义公网' },
+        ], model.wan_mode, (v) => { model.wan_mode = v; syncWan(); });
+        syncWan();
+        append(kindBox, h('div', { class: 'card mt-3' }, [
+          h('div', { class: 'card-head' }, [h('h2', { text: '外网访问' })]),
+          h('div', { class: 'card-body' }, [
+            h('div', { class: 'form-grid' }, [
+              field('访问方式', wanSeg),
+              h('div', { class: 'field' }, [
+                h('label', { text: '公网反代地址' }),
+                publicInput,
+                wanHint,
+              ]),
+            ]),
+            h('ul', { class: 'muted mt-2', style: { fontSize: '.78rem', paddingLeft: '1rem', lineHeight: 1.6 } }, [
+              h('li', { text: '飞牛 ID：原样沿用，入口声明协议 + 端口。内网直连、外网经 FN Connect 中继。' }),
+              h('li', { text: 'fnOS 反代：入口不声明端口，让 fnOS Nginx 按子应用名反代。到 fnOS 应用设置里填反代域名后直接生效。' }),
+              h('li', { text: '自定义公网：外网优先跳到你自己配的反代域名（如 https://ha.example.com），内网不受影响。' }),
+            ]),
+          ]),
+        ]));
+
         /* 连通性测试 */
         const probeBox = h('div', { class: 'mt-3' });
         append(kindBox, h('div', { class: 'row mt-3' }, [
@@ -298,6 +348,17 @@ export function openLinkEditor(existing = null, preset = {}) {
             notify.warn('端口映射形态必须填写目标主机');
             return;
           }
+          if (model.kind !== 'shortcut' && model.wan_mode === 'public') {
+            const url = model.public_url.trim();
+            if (!url) {
+              notify.warn('选择自定义公网反代时必须填写反代地址');
+              return;
+            }
+            if (!/^https?:\/\//i.test(url)) {
+              notify.warn('反代地址需以 http:// 或 https:// 开头');
+              return;
+            }
+          }
           await withBusy(e.currentTarget, async () => {
             const payload = toPayload(model);
             try {
@@ -362,6 +423,8 @@ function toPayload(model) {
     host: model.kind === 'local' ? 'localhost' : model.host.trim(),
     port: model.kind === 'shortcut' ? 0 : Number(model.port) || 0,
     path: path || '/',
+    wan_mode: model.kind === 'shortcut' ? '' : (model.wan_mode === 'fn_proxy' ? 'fn_proxy' : (model.wan_mode === 'public' ? 'public' : 'relay')),
+    public_url: model.kind === 'shortcut' ? '' : model.public_url.trim(),
     ui: model.ui,
     all_users: model.all_users,
     no_display: model.no_display,

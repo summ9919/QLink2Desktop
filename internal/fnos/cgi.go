@@ -1,8 +1,10 @@
 package fnos
 
 import (
+	"encoding/json"
 	"fmt"
 	"html"
+	"strconv"
 	"strings"
 )
 
@@ -148,4 +150,165 @@ func redirectPage(target string) string {
 <script>window.location.replace(%q);</script>
 </body>
 </html>`, escaped, escaped, escaped, target)
+}
+
+// ---------------------------------------------------------------------------
+// 外网优先公网反代
+// ---------------------------------------------------------------------------
+
+// wanCGIScriptTemplate 生成「外网走公网反代、内网直连本机」的 CGI 脚本。
+//
+// 飞牛入口配置只能声明一个 host（浏览器当前地址），没有「外网换域名」的字段，
+// 所以分流只能发生在脚本里：按 HTTP_HOST 判断这次请求是内网还是外网。
+//
+// 判定用保守的白名单：私有 IP、localhost、无点主机名、*.local / *.lan、
+// IPv6 字面量视为内网；其余一律视为外网。用带点的自定义局域网域名
+// （例如 nas.home.example.com）会被当成外网 —— 这最多是多走一次反代，
+// 不会把外网用户错误地留在中继上，方向是安全的。
+const wanCGIScriptTemplate = `#!/bin/bash
+# 由 QLink2Desktop 自动生成 —— 请勿手工修改，重新安装会覆盖。
+#
+# 外网优先走用户自己的公网反代，内网仍然直连本机端口。
+# 判定依据是浏览器请求的 Host：
+#   私有 IP / localhost / 无点主机名 / *.local / *.lan / IPv6 字面量 → 内网；
+#   其余（飞牛中继域名、公网域名等）→ 302 到配置的公网反代地址。
+set -u
+
+PUBLIC_TARGET=%s
+LOCAL_SCHEME=%s
+LOCAL_PORT=%s
+LOCAL_PATH=%s
+
+host="${HTTP_HOST:-${SERVER_NAME:-}}"
+# 有的网关会把 Host 改写成回环地址；这时原始域名在 X-Forwarded-Host 里。
+# 只有 Host 缺失或确实是回环地址时才采信它，避免覆盖浏览器真实地址。
+fwd="${HTTP_X_FORWARDED_HOST:-}"
+case "$fwd" in
+  *,*) fwd="${fwd%%,*}" ;;
+esac
+case "$host" in
+  ""|localhost|127.*|\[::1\]) host="${fwd:-$host}" ;;
+esac
+# 去掉端口；IPv6 字面量形如 [fd00::1]:8000。
+case "$host" in
+  \[*\]:*) host="${host%%:*}" ;;
+  \[*\]) ;;
+  *:*) host="${host%%%%:*}" ;;
+esac
+
+is_lan=0
+case "$host" in
+  ""|localhost|127.*|10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|\[*|*.local|*.lan)
+    is_lan=1
+    ;;
+  *.*)
+    is_lan=0
+    ;;
+  *)
+    # 不带点的主机名（例如飞牛设备名）通常只在内网可达。
+    is_lan=1
+    ;;
+esac
+
+if [ "$is_lan" = "1" ] && [ -n "$host" ] && [ -n "$LOCAL_PORT" ]; then
+  TARGET="${LOCAL_SCHEME}://${host}:${LOCAL_PORT}${LOCAL_PATH}"
+else
+  TARGET="${PUBLIC_TARGET}"
+fi
+
+printf 'Status: 302 Found\r\n'
+printf 'Location: %%s\r\n' "${TARGET}"
+printf 'Cache-Control: no-store\r\n'
+printf 'Content-Type: text/html; charset=utf-8\r\n'
+printf '\r\n'
+
+# 兜底页面：中间层吃掉 Location 头时，用 JS 按同样的规则再跳一次。
+cat << 'QLINK_CGI_FALLBACK'
+%s
+QLINK_CGI_FALLBACK
+exit 0
+`
+
+// buildWANRedirectScript 组装「外网优先公网反代」的 CGI 脚本。
+func buildWANRedirectScript(spec PackageSpec) string {
+	publicTarget := sanitizeTarget(joinPublicTarget(spec.PublicURL, spec.Path))
+	localScheme := spec.Scheme
+	if localScheme == "" {
+		localScheme = "http"
+	}
+	localPath := sanitizeTarget(strings.TrimSpace(spec.Path))
+	if localPath == "" {
+		localPath = "/"
+	}
+	localPort := ""
+	if spec.LocalPort > 0 {
+		localPort = strconv.Itoa(spec.LocalPort)
+	}
+	return fmt.Sprintf(wanCGIScriptTemplate,
+		shellQuote(publicTarget),
+		shellQuote(localScheme),
+		shellQuote(localPort),
+		shellQuote(localPath),
+		wanRedirectPage(publicTarget, localScheme, spec.LocalPort, localPath),
+	)
+}
+
+// joinPublicTarget 把反代地址与访问路径拼成完整目标。
+// 反代地址允许带路径前缀（如 https://example.com/alist）。
+func joinPublicTarget(base, path string) string {
+	base = strings.TrimRight(strings.TrimSpace(base), "/")
+	path = strings.TrimSpace(path)
+	if path == "" || path == "/" {
+		return base + "/"
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return base + path
+}
+
+// wanRedirectPage 是外网反代模式的兜底页面。
+//
+// 不能用静态的 meta refresh：目标取决于访问来源（内网 / 外网），
+// 只能在浏览器里按 location.hostname 再判一次。
+// 所有地址都经 json.Marshal 编码（它会转义 < > &），避免 </script> 之类的
+// 内容提前闭合脚本。
+func wanRedirectPage(publicTarget, localScheme string, localPort int, localPath string) string {
+	return fmt.Sprintf(`<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>正在跳转…</title>
+<style>
+  body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+       font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+       background:#f8fafc;color:#475569}
+</style>
+</head>
+<body>
+<p>正在跳转…</p>
+<script>
+(function () {
+  var host = location.hostname || '';
+  var pub = %s;
+  var lan = host === 'localhost'
+    || /^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(host)
+    || host.indexOf('.') === -1;
+  var target = pub;
+  if (lan && host && %d > 0) { target = %s + '://' + host + ':' + %d + %s; }
+  location.replace(target);
+})();
+</script>
+</body>
+</html>`, jsString(publicTarget), localPort, jsString(localScheme), localPort, jsString(localPath))
+}
+
+// jsString 把字符串编码成安全的 JS 字面量。
+func jsString(s string) string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		return `""`
+	}
+	return string(b)
 }

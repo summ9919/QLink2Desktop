@@ -27,12 +27,24 @@ type PackageSpec struct {
 	Title   string
 	Desc    string
 
-	// Port > 0 走「直连端口」模式；Port == 0 走 CGI 或外链模式。
+	// Port > 0 走「直连端口」模式（入口声明 port）；Port == 0 走 CGI 或 fnOS 反代。
 	Port int
-	// Scheme/Path 用于端口模式；ShortcutURL 用于 CGI 模式。
+	// ManifestPort 是 manifest 里要声明的 service_port。
+	// routeDirect 时通常等于 Port；routeFnosProxy / routeRedirect 时
+	// 也可能有值（让 fnOS Nginx 知道反代到哪）。
+	// 为 0 表示不声明 service_port（例如纯快捷方式、没有真实后端的场景）。
+	ManifestPort int
+	// Scheme/Path 用于端口 / fnOS 反代模式；ShortcutURL 用于 CGI 模式。
 	Scheme      string
 	Path        string
 	ShortcutURL string
+
+	// WANMode / PublicURL 启用「外网优先走公网反代」。
+	// 此时入口不声明端口（仍走 CGI），由 CGI 按访问来源分流：
+	// 内网直连 LocalPort，外网 302 到 PublicURL。
+	WANMode   domain.WANMode
+	PublicURL string
+	LocalPort int
 
 	UI        domain.UIType
 	AllUsers  bool
@@ -46,29 +58,39 @@ type PackageSpec struct {
 type routeMode int
 
 const (
-	routeDirect   routeMode = iota // 直接声明 protocol + port + url
-	routeRedirect                  // CGI 302 跳转
+	routeDirect    routeMode = iota // 直接声明 protocol + port + url（保留既有形态）
+	routeRedirect                   // CGI 302 跳转
+	routeFnosProxy                  // fnOS 内置 Nginx 反代（入口不声明 port，让 fnOS 自己反代到 service_port）
 )
 
-// decideRoute 是两种模式唯一的判定入口。
+// decideRoute 是三种模式唯一的判定入口。
 //
-// 判定只有一条：**有真实端口就直连，没有就走 CGI 302**。
+// 三种形态的触发条件（按优先级从高到低）：
 //
-// 为什么"没有端口"的形态不能声明成绝对外链（曾经的 routeExternal）：
-// 飞牛桌面对入口地址的拼接规则是
+//  1. WANModePublic + 有反代地址  → routeRedirect
+//     入口没有地方能直接换外网域名，只能让 CGI 脚本按访问来源分流
+//     （外网 302 到用户反代域名，内网回到 fnOS 反代路径或本机端口）。
 //
-//	{protocol}://{当前浏览器 hostname}:{port}{url}
+//  2. WANModeFnosProxy           → routeFnosProxy
+//     入口不声明 port、protocol 留空（自适应），只写相对路径。
+//     manifest 里永远声明 service_port 让 fnOS Nginx 反代接手。
+//     浏览器拼出来的是 hostname + 子路径（没有端口），
+//     用户再到 fnOS 应用设置里填反代域名 / 子域名反代即可。
 //
-// host 那一截**永远是飞牛自己**（内网是 NAS 的 IP，走 FN Connect 是飞牛的中继
-// 域名），入口配置里没有地方能指定别的主机。所以把 url 写成
-// "https://www.baidu.com" 只会被拼成
-// "http://<NAS>:<端口>https://www.baidu.com" —— 真机上点开就是这个错误地址
-// （用户实测的复原图正是"飞牛地址 + 目标网址"）。
+//  3. Port > 0（WANModeRelay）    → routeDirect
+//     保留既有形态：入口声明 protocol + port + url。
+//     浏览器拼 protocol://hostname:port/url，
+//     内网直连本机 IP，外网经 FN Connect 时由中继给三级子域名。
 //
-// 想跳到飞牛以外的地址，唯一可行的手段是让一个能执行的东西返回 302：
-// CGI 入口沿用当前访问域名，再由脚本把浏览器发往目标站点。这是社区验证过的
-// 唯一路径，因此「没有端口」一律走 CGI 302。
+//  4. 无端口（快捷方式等）        → routeRedirect
+//     没什么可走，只能 CGI 302 兜底。
 func decideRoute(spec PackageSpec) routeMode {
+	if spec.WANMode == domain.WANModePublic && strings.TrimSpace(spec.PublicURL) != "" {
+		return routeRedirect
+	}
+	if spec.WANMode == domain.WANModeFnosProxy {
+		return routeFnosProxy
+	}
 	if spec.Port > 0 {
 		return routeDirect
 	}
@@ -199,7 +221,14 @@ func writeManifest(dir string, spec PackageSpec) error {
 	if !spec.NoDisplay {
 		// 入口 ID 与 ui/config 中的键必须一字不差。
 		m.WithLaunchName(UIEntryKey(spec.AppName))
-		m.WithServicePort(spec.Port)
+		// service_port 让 fnOS Nginx 知道反代目标端口。
+		// routeDirect / routeFnosProxy / WANModePublic-CGI 都需要它，
+		// 只有纯快捷方式（没真实后端）才不声明。
+		port := spec.ManifestPort
+		if port <= 0 {
+			port = spec.Port
+		}
+		m.WithServicePort(port)
 	}
 	return os.WriteFile(filepath.Join(dir, "manifest"), m.Bytes(), 0o644)
 }
@@ -290,9 +319,16 @@ func BuildUIEntry(spec PackageSpec) uiEntry {
 
 		// 飞牛 Connect 的外网子域名网关按 Cookie 域隔离来鉴权；
 		// 若桌面入口声明为「仅管理员可见」，外网访问会被网关直接拒绝并报
-		// “FN Connect 暂无权限访问该服务”。因此凡是走端口的入口一律放开为全员可见。
+		// "FN Connect 暂无权限访问该服务"。因此凡是走端口的入口一律放开为全员可见。
 		// 这是原项目踩过的坑，保留同样的处理并在此显式记录原因。
 		entry.AllUsers = true
+
+	case routeFnosProxy:
+		// fnOS 内置反代形态：入口不声明 port、protocol 留空让 fnOS 自适应，
+		// 只写相对路径。manifest 里声明 service_port 让 fnOS Nginx 把
+		// 这个入口反代到目标端口。浏览器拼出来的就是 hostname + 子路径，
+		// 没有单独端口。
+		entry.URL = proxyEntryPath(spec.AppName, spec.Path)
 
 	default:
 		// CGI 跳转经由 CGI 入口，此时不声明端口与协议。
@@ -303,6 +339,34 @@ func BuildUIEntry(spec PackageSpec) uiEntry {
 		entry.URL = cgiEntryPath(spec.AppName)
 	}
 	return entry
+}
+
+// proxyEntryPath 为 fnOS 反代形态生成入口 url。
+//
+// 我们这里约定子应用入口的反代路径前缀就是 appname（小写，去掉 qlink2d. 前缀），
+// 这样 fnOS Nginx 可以按路径前缀反代：
+//
+//	https://NAS-域名/<appname-path-prefix>/  →  127.0.0.1:service_port/
+//
+// 用户可以在 fnOS 应用设置里给应用单独配子域名反代，也可以直接走
+// 路径反代。两种反代形态共存，浏览器看到的都是"没有单独端口"的干净 URL。
+func proxyEntryPath(appName, userPath string) string {
+	prefix := strings.TrimPrefix(appName, "qlink2d.")
+	prefix = strings.ToLower(strings.TrimSpace(prefix))
+	if prefix == "" {
+		prefix = "app"
+	}
+	userPath = strings.TrimSpace(userPath)
+	if userPath == "" {
+		userPath = "/"
+	}
+	if !strings.HasPrefix(userPath, "/") {
+		userPath = "/" + userPath
+	}
+	if prefix == "/" {
+		return userPath
+	}
+	return "/" + prefix + userPath
 }
 
 func writeUIConfig(dir string, spec PackageSpec) error {
@@ -450,6 +514,9 @@ func writeLifecycleScripts(dir string, spec PackageSpec) error {
 func renderCGIScript(spec PackageSpec) (string, bool) {
 	if !needsCGI(spec) {
 		return "", false
+	}
+	if spec.WANMode == domain.WANModePublic && strings.TrimSpace(spec.PublicURL) != "" {
+		return buildWANRedirectScript(spec), true
 	}
 	target := strings.TrimSpace(spec.ShortcutURL)
 	if target == "" {

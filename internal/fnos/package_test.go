@@ -221,6 +221,119 @@ func TestBuildPackageShortcutUsesCGI302(t *testing.T) {
 	}
 }
 
+// TestBuildPackageWANPublicUsesCGI 锁定「外网优先公网反代」的包形态：
+// 入口必须放弃端口、改走 CGI；脚本同时带上公网目标与本机回退端口。
+func TestBuildPackageWANPublicUsesCGI(t *testing.T) {
+	t.Parallel()
+
+	spec := baseSpec("qlink2d.wan-1")
+	spec.Port = 0 // service 层在公网模式下会清零
+	spec.LocalPort = 5244
+	spec.Scheme = domain.SchemeHTTP
+	spec.Path = "/admin"
+	spec.WANMode = domain.WANModePublic
+	spec.PublicURL = "https://ha.example.com"
+
+	dir := buildInto(t, spec)
+
+	entry := readEntry(t, dir, spec.AppName)
+	if !strings.HasPrefix(entry.URL, "/cgi/ThirdParty/") {
+		t.Errorf("公网反代模式应走 CGI 分流，实际 url=%q", entry.URL)
+	}
+	if entry.Port != "" || entry.Protocol != "" {
+		t.Errorf("分流入口不该声明端口/协议，实际 port=%q protocol=%q", entry.Port, entry.Protocol)
+	}
+
+	// 入口不声明端口时，manifest 也不应写 service_port。
+	if mf := parseManifest(t, dir); mf["service_port"] != "" {
+		t.Errorf("分流入口不应声明 service_port，实际 %q", mf["service_port"])
+	}
+
+	cgi, err := os.ReadFile(filepath.Join(dir, "app", UIDir, "index.cgi"))
+	if err != nil {
+		t.Fatalf("公网反代模式必须生成 index.cgi: %v", err)
+	}
+	body := string(cgi)
+	for _, want := range []string{
+		"PUBLIC_TARGET='https://ha.example.com/admin'",
+		"LOCAL_SCHEME='http'",
+		"LOCAL_PORT='5244'",
+		"LOCAL_PATH='/admin'",
+		"is_lan=1",
+		"Status: 302",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("CGI 脚本缺少 %q:\n%s", want, body)
+		}
+	}
+}
+
+// TestCGIScriptWANSplitsByHost 真正执行脚本，确认内外网各走各的地址。
+//
+// 这条测试的价值在于：只断言脚本里"有 is_lan 段"是拦不住逻辑错误的
+// （比如端口没拼进去、IPv6 截断截错）。必须像网关一样用 env -i 跑一遍。
+func TestCGIScriptWANSplitsByHost(t *testing.T) {
+	t.Parallel()
+	if !canRunBash(t) {
+		t.Skip("当前平台没有 bash，跳过脚本执行验证")
+	}
+
+	spec := baseSpec("qlink2d.wan-run")
+	spec.Port = 0
+	spec.LocalPort = 5244
+	spec.Scheme = domain.SchemeHTTP
+	spec.Path = "/admin"
+	spec.WANMode = domain.WANModePublic
+	spec.PublicURL = "https://ha.example.com"
+
+	dir := buildInto(t, spec)
+	cgiPath := filepath.ToSlash(filepath.Join(dir, "app", UIDir, "index.cgi"))
+
+	cases := []struct {
+		name string
+		env  []string
+		want string
+	}{
+		{"内网 IPv4", []string{"HTTP_HOST=192.168.1.10:8000"},
+			"Location: http://192.168.1.10:5244/admin"},
+		{"内网 10 段", []string{"HTTP_HOST=10.0.0.2"},
+			"Location: http://10.0.0.2:5244/admin"},
+		{"内网 .local", []string{"HTTP_HOST=nas.local:8000"},
+			"Location: http://nas.local:5244/admin"},
+		{"内网无点主机名", []string{"HTTP_HOST=nas"},
+			"Location: http://nas:5244/admin"},
+		{"内网 IPv6", []string{"HTTP_HOST=[fd00::1]:8000"},
+			"Location: http://[fd00::1]:5244/admin"},
+		{"飞牛中继域名", []string{"HTTP_HOST=abc.fnos.net"},
+			"Location: https://ha.example.com/admin"},
+		{"公网域名", []string{"HTTP_HOST=ha.example.com"},
+			"Location: https://ha.example.com/admin"},
+		{"缺少 Host", nil,
+			"Location: https://ha.example.com/admin"},
+		{"网关改写为回环时采信 X-Forwarded-Host", []string{
+			"HTTP_HOST=127.0.0.1:8000", "HTTP_X_FORWARDED_HOST=abc.fnos.net"},
+			"Location: https://ha.example.com/admin"},
+		{"X-Forwarded-Host 为内网时仍直连", []string{
+			"HTTP_HOST=127.0.0.1:8000", "HTTP_X_FORWARDED_HOST=192.168.1.10:8000"},
+			"Location: http://192.168.1.10:5244/admin"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			args := append([]string{"-i"}, tc.env...)
+			cmd := exec.Command("env", append(args, cgiPath)...)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("脚本执行失败: %v\n输出:\n%s", err, out)
+			}
+			if !strings.Contains(string(out), tc.want) {
+				t.Errorf("环境 %v 时应跳转到 %q，实际输出:\n%s", tc.env, tc.want, out)
+			}
+		})
+	}
+}
+
 // TestCGIScriptRunsWithoutTrimEnv 是本次真机事故的正牌回归守卫。
 //
 // 之前那版 index.cgi 在开头写了 set -u，却又直接在引号里展开 ${TRIM_APPDEST}。

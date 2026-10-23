@@ -148,9 +148,9 @@ function row(view) {
     ]),
     status.last_error
       ? h('div', { class: 'cell-sub', text: status.last_error, title: status.last_error })
-      : (link.enabled && status.proxy_port
+      : (openHint(link) || (link.enabled && status.proxy_port
           ? h('div', { class: 'cell-sub', text: `代理端口 ${status.proxy_port}` })
-          : openHint(link)),
+          : null)),
   ]);
 
   return h('tr', {}, [
@@ -280,6 +280,12 @@ function openHint(link) {
     // 快捷方式没有本机端口，只能由飞牛的 CGI 入口 302 到目标网址 ——
     // 桌面入口的地址拼接规则决定了没法直接写外站主机，详见 ARCHITECTURE。
     return h('div', { class: 'cell-sub', text: '经飞牛跳转入口 302 到目标网址，不占本机端口' });
+  }
+  if (link.wan_mode === 'public' && link.public_url) {
+    return h('div', {
+      class: 'cell-sub', title: `外网访问经 ${link.public_url}，内网仍直连本机端口`,
+      text: `外网走 ${link.public_url}`,
+    });
   }
   return null;
 }

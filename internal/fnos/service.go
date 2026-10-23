@@ -395,22 +395,46 @@ func (s *Service) buildSpec(l domain.Link, portOverride int) PackageSpec {
 	icons := ResolveIcon(s.iconRequest(l))
 
 	spec := PackageSpec{
-		AppName:   l.EffectiveAppName(),
-		Title:     l.Name,
-		Desc:      l.Desc,
-		Port:      port,
-		Scheme:    scheme,
-		Path:      l.Path,
-		UI:        l.UI,
-		AllUsers:  l.AllUsers,
-		NoDisplay: l.NoDisplay,
-		FileTypes: l.FileTypes,
-		Icons:     icons,
+		AppName:      l.EffectiveAppName(),
+		Title:        l.Name,
+		Desc:         l.Desc,
+		Port:         port,
+		ManifestPort: port, // 默认与入口端口一致，后面可能被 WANMode 改写
+		Scheme:       scheme,
+		Path:         l.Path,
+		UI:           l.UI,
+		AllUsers:     l.AllUsers,
+		NoDisplay:    l.NoDisplay,
+		FileTypes:    l.FileTypes,
+		Icons:        icons,
 	}
 	if l.Kind == domain.KindShortcut {
 		// 网址快捷方式没有本地端口，只能走 CGI 302（原因见 decideRoute 的注释：
 		// 入口配置无法指定飞牛以外的主机）。这里把目标地址传给 CGI 兜底页。
 		spec.ShortcutURL = l.ShortcutURL()
+		spec.ManifestPort = 0 // 纯快捷方式不需要 fnOS 反代
+	}
+
+	switch l.WANMode {
+	case domain.WANModeFnosProxy:
+		// fnOS 反代形态：入口不声明 port，让 fnOS Nginx / 子域名反代接手。
+		// manifest 仍然声明 service_port 让 fnOS 知道反代到哪。
+		spec.WANMode = domain.WANModeFnosProxy
+		spec.Port = 0
+		// ManifestPort 保持 port 不变（让 fnOS Nginx 反代到真实端口）。
+
+	case domain.WANModePublic:
+		// 外网优先走公网反代：入口走 CGI 分流，外网 302 到用户反代域名，
+		// 内网回到本机端口。manifest 里仍然声明 service_port，
+		// 让 fnOS Nginx 反代到内网端口（CGI 脚本内网分支走这个路径）。
+		spec.WANMode = domain.WANModePublic
+		spec.PublicURL = l.PublicURL
+		spec.LocalPort = port
+		spec.Port = 0
+		// ManifestPort 保持 port。
+
+	default:
+		spec.WANMode = domain.WANModeRelay
 	}
 	return spec
 }
